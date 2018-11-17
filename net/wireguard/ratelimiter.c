@@ -13,7 +13,7 @@ static struct kmem_cache *entry_cache;
 static hsiphash_key_t key;
 static spinlock_t table_lock = __SPIN_LOCK_UNLOCKED("ratelimiter_table_lock");
 static DEFINE_MUTEX(init_lock);
-static u64 init_refcnt; /* Protected by init_lock, hence not atomic. */
+static atomic64_t refcnt = ATOMIC64_INIT(0);
 static atomic_t total_entries = ATOMIC_INIT(0);
 static unsigned int max_entries, table_size;
 static void wg_ratelimiter_gc_entries(struct work_struct *);
@@ -24,7 +24,8 @@ static struct hlist_head *table_v6;
 #endif
 
 struct ratelimiter_entry {
-	u64 last_time_ns, tokens, ip;
+	u64 last_time_ns, tokens;
+	__be64 ip;
 	void *net;
 	spinlock_t lock;
 	struct hlist_node hash;
@@ -83,25 +84,21 @@ static void wg_ratelimiter_gc_entries(struct work_struct *work)
 
 bool wg_ratelimiter_allow(struct sk_buff *skb, struct net *net)
 {
-	/* We only take the bottom half of the net pointer, so that we can hash
-	 * 3 words in the end. This way, siphash's len param fits into the final
-	 * u32, and we don't incur an extra round.
-	 */
-	const u32 net_word = (unsigned long)net;
+	struct { __be64 ip; u32 net; } data = {
+		.net = (unsigned long)net & 0xffffffff };
 	struct ratelimiter_entry *entry;
 	struct hlist_head *bucket;
-	u64 ip;
 
 	if (skb->protocol == htons(ETH_P_IP)) {
-		ip = (u64 __force)ip_hdr(skb)->saddr;
-		bucket = &table_v4[hsiphash_2u32(net_word, ip, &key) &
+		data.ip = (__force __be64)ip_hdr(skb)->saddr;
+		bucket = &table_v4[hsiphash(&data, sizeof(u32) * 3, &key) &
 				   (table_size - 1)];
 	}
 #if IS_ENABLED(CONFIG_IPV6)
 	else if (skb->protocol == htons(ETH_P_IPV6)) {
-		/* Only use 64 bits, so as to ratelimit the whole /64. */
-		memcpy(&ip, &ipv6_hdr(skb)->saddr, sizeof(ip));
-		bucket = &table_v6[hsiphash_3u32(net_word, ip >> 32, ip, &key) &
+		memcpy(&data.ip, &ipv6_hdr(skb)->saddr,
+		       sizeof(__be64)); /* Only 64 bits */
+		bucket = &table_v6[hsiphash(&data, sizeof(u32) * 3, &key) &
 				   (table_size - 1)];
 	}
 #endif
@@ -109,7 +106,7 @@ bool wg_ratelimiter_allow(struct sk_buff *skb, struct net *net)
 		return false;
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(entry, bucket, hash) {
-		if (entry->net == net && entry->ip == ip) {
+		if (entry->net == net && entry->ip == data.ip) {
 			u64 now, tokens;
 			bool ret;
 			/* Quasi-inspired by nft_limit.c, but this is actually a
@@ -140,7 +137,7 @@ bool wg_ratelimiter_allow(struct sk_buff *skb, struct net *net)
 		goto err_oom;
 
 	entry->net = net;
-	entry->ip = ip;
+	entry->ip = data.ip;
 	INIT_HLIST_NODE(&entry->hash);
 	spin_lock_init(&entry->lock);
 	entry->last_time_ns = ktime_get_boot_fast_ns();
@@ -158,7 +155,7 @@ err_oom:
 int wg_ratelimiter_init(void)
 {
 	mutex_lock(&init_lock);
-	if (++init_refcnt != 1)
+	if (atomic64_inc_return(&refcnt) != 1)
 		goto out;
 
 	entry_cache = KMEM_CACHE(ratelimiter_entry, 0);
@@ -197,7 +194,7 @@ out:
 err_kmemcache:
 	kmem_cache_destroy(entry_cache);
 err:
-	--init_refcnt;
+	atomic64_dec(&refcnt);
 	mutex_unlock(&init_lock);
 	return -ENOMEM;
 }
@@ -205,7 +202,7 @@ err:
 void wg_ratelimiter_uninit(void)
 {
 	mutex_lock(&init_lock);
-	if (!init_refcnt || --init_refcnt)
+	if (atomic64_dec_if_positive(&refcnt))
 		goto out;
 
 	cancel_delayed_work_sync(&gc_work);
